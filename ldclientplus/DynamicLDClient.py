@@ -79,14 +79,38 @@ class DynamicLDClient():
         prompt = f"Enter password for {self.username} on {self.host}: "
         return getpass(prompt)
     
-    def _load_ldclient_module(self, name, module_file):
+    def _load_ldclient_module(self, module_name, module_file):
         module_path = os.path.join(self._ldclient_dir, module_file)
-        module_name = f"{name}_{self.host.split('.')[0]}"
         spec = importlib.util.spec_from_file_location(module_name, module_path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
+    
+    def _hack_replace_ldclient_module_name(self, ldclient_module_name):
+        for fn in ('models.py', 'requests.py'):
+            try:
+                with open(os.path.join(self._ldclient_dir, ldclient_module_name, fn), 'r') as fin:
+                    models = fin.read()
+                models = models.replace('from ldclient', f'from {ldclient_module_name}')
+                with open(os.path.join(self._ldclient_dir, ldclient_module_name, fn), 'w') as fout:
+                    fout.write(models)
+            except IOError:
+                pass
+    
+    def _get_ldclient_version(self):
+        # gets ldclient version (x.x.x) before import
+        fn = os.path.join(self._ldclient_dir, 'ldclient_version.py')
+        try:
+            with open(fn, 'r') as fin:
+                for line in fin:
+                    m = re.match("VERSION = [\"']([0-9]+.[0-9]+.[0-9]+)[\"']", line)
+                    if m:
+                        return m.group(1)
+                else:
+                    raise RuntimeError(f"Could not determine ldclient version from {fn}")
+        except IOError:
+            logger.exception("ldclient_version.py not present. Can't determine ldclient version.")
 
     def _get_api(self, extra_modules=None):
         try:
@@ -124,12 +148,19 @@ class DynamicLDClient():
             except IndexError:
                 logger.error("Could not find location of extracted ldclient package.")
                 raise
+            
+            ldclient_version = self._get_ldclient_version()
+            ldclient_module_name = f"ldclient_{ldclient_version.replace('.', '')}"
+
+            os.rename(os.path.join(self._ldclient_dir, 'ldclient'), os.path.join(self._ldclient_dir, ldclient_module_name))
+            
+            self._hack_replace_ldclient_module_name(ldclient_module_name)
+            
             importlib.invalidate_caches()
             sys.path.insert(0, self._ldclient_dir)
+            
             try:
-                #FIXME This breaks when loading 8.10 after 8.9. Somehow when importing 8.10
-                # it already points `ldclient` at 8.9 somehow, and doesn't find `base.py`
-                ldclient = self._load_ldclient_module('ldclient', 'ldclient/__init__.py')
+                ldclient = self._load_ldclient_module(ldclient_module_name, f'{ldclient_module_name}/__init__.py')
             except ImportError as e:
                 logger.exception(f"Could not import ldclient: {e}")
                 raise
@@ -140,7 +171,7 @@ class DynamicLDClient():
                 mod_parts = mod.split('.')
                 logger.debug(mod_parts)
                 try:
-                    module  = self._load_ldclient_module(f'ldclient.{mod}', f'ldclient/{"/".join(mod_parts)}.py')
+                    module  = self._load_ldclient_module(f'{ldclient_module_name}.{mod}', f'{ldclient_module_name}/{"/".join(mod_parts)}.py')
                     mod_dict = module
                     for part in mod_parts[1:]:
                         mod_dict = {part: mod_dict}
